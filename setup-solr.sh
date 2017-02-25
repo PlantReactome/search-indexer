@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env bash
-
+#!/bin/bash
 #-----------------------------------------------------------
 # Script that automates the Reactome Solr initial setup.
 # Execute the files as $sudo ./setup_solr.sh -h
@@ -25,17 +24,17 @@ where:
         -f  Neo4j User                  DEFAULT: neo4j
         -g  Neo4j Password              REQUIRED
 
-        -j  Solr Core name              DEFAULT: reactome
+        -j  Solr Core name              DEFAULT: plantreactome
         -k  Solr Port                   DEFAULT: 8983
-        -l  Solr User                   DEFAULT: admin
+        -l  Solr User                   DEFAULT: solr_admin
         -m  Solr Password               REQUIRED
         -n  Solr Version                DEFAULT: 6.2.0
 
-        -o  Interactors database path   DEFAULT: /usr/local/reactomes/Reactome/production/ContentService/interactors.db
+        -o  Interactors database path   DEFAULT: /usr/local/reactomes/PlantReactome/development/ContentService/interactors.db
 
-        -p  Mail Smtp server            DEFAULT: smtp.oicr.on.ca
-        -q  Mail Smtp port              DEFAULT: 25
-        -r  Mail From                   DEFAULT: reactome-developer@reactome.org
+        -p  Mail Smtp server            DEFAULT: ""
+        -q  Mail Smtp port              DEFAULT: ""
+        -r  Mail From                   DEFAULT: reactome-curator@gramene.org
 
         -s  XML output for EBeye        DEFAULT: false
         -t  Send indexing report mail   DEFAULT: false
@@ -49,9 +48,9 @@ _IMPORT_DATA=false
 
 _SOLR_HOME="/var/solr"
 
-_SOLR_CORE="reactome"
+_SOLR_CORE="plantreactome"
 _SOLR_PORT=8983
-_SOLR_USER="admin"
+_SOLR_USER="solr_admin"
 _SOLR_PASSWORD=""
 _SOLR_VERSION="6.2.0"
 
@@ -60,11 +59,11 @@ _NEO4J_PORT="7474"
 _NEO4J_USER="neo4j"
 _NEO4J_PASSWORD=""
 
-_INTERACTORS_DB="/usr/local/reactomes/Reactome/production/ContentService/interactors.db"
+_INTERACTORS_DB="/usr/local/reactomes/PlantReactome/development/ContentService/interactors.db"
 
-_MAIL_SMTP="smtp.oicr.on.ca"
-_MAIL_PORT="25"
-_MAIL_DEST="reactome-developer@reactome.org"
+_MAIL_SMTP=""
+_MAIL_PORT=""
+_MAIL_DEST="reactome-curator@gramene.org"
 
 _XML=""
 _MAIL=""
@@ -149,7 +148,7 @@ installSolr () {
     echo "Start SolR installation script"
 
     echo "Stopping current SolR installation."
-    sudo service solr stop >/dev/null 2>&1
+    sudo /etc/init.d/solr stop >/dev/null 2>&1
 
     echo "Deleting old Solr installed instances"
 
@@ -223,12 +222,21 @@ installSolr () {
     sudo mkdir -p $_SOLR_CORE_CONF_DIR
 
     echo "Updating SolR Configuration files based on GitHub"
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/schema.xml -O $_SOLR_CORE_CONF_DIR/schema.xml >/dev/null 2>&1
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/solrconfig.xml -O $_SOLR_CORE_CONF_DIR/solrconfig.xml >/dev/null 2>&1
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/stopwords.txt -O $_SOLR_CORE_CONF_DIR/stopwords.txt >/dev/null 2>&1
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/prefixstopwords.txt -O $_SOLR_CORE_CONF_DIR/prefixstopwords.txt >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/schema.xml -O $_SOLR_CORE_CONF_DIR/schema.xml >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/solrconfig.xml -O $_SOLR_CORE_CONF_DIR/solrconfig.xml >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/stopwords.txt -O $_SOLR_CORE_CONF_DIR/stopwords.txt >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/prefixstopwords.txt -O $_SOLR_CORE_CONF_DIR/prefixstopwords.txt >/dev/null 2>&1
 
     sudo chown -R solr:solr $_SOLR_DATA_DIR/$_SOLR_CORE
+
+    echo "Checking if Solr is running"
+    _STATUS=$(curl -H "Content-Type: application/json" --user $_SOLR_USER:$_SOLR_PASSWORD --write-out "%{http_code}\n" --silent --output /dev/null http://localhost:$_SOLR_PORT/solr/admin/cores?action=STATUS)
+    if [ 200 != "$_STATUS" ]; then
+        if ! sudo /etc/init.d/solr start >/dev/null 2>&1; then
+            echo "Solr is not running and can not be started"
+            exit 1;
+        fi
+    fi
 
     echo "Creating new Solr core"
 
@@ -240,13 +248,13 @@ installSolr () {
     echo "Solr core has been created."
 
     echo "Enabling Solr admin authentication in Jetty"
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-jetty-conf/jetty.xml  -O /opt/solr-$_SOLR_VERSION/server/etc/jetty.xml
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-jetty-conf/webdefault.xml  -O /opt/solr-$_SOLR_VERSION/server/etc/webdefault.xml
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-jetty-conf/jetty.xml  -O /opt/solr-$_SOLR_VERSION/server/etc/jetty.xml
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-jetty-conf/webdefault.xml  -O /opt/solr-$_SOLR_VERSION/server/etc/webdefault.xml
 
     sudo bash -c "echo $_SOLR_USER: '$_SOLR_PASSWORD',solr-admin > /opt/solr-$_SOLR_VERSION/server/etc/realm.properties"
 
     echo "Restart solr service..."
-    if ! sudo service solr restart; then
+    if ! sudo /etc/init.d/solr restart; then
         echo "Could not restart Solr server"
     fi
 
@@ -269,7 +277,7 @@ updateSolrConfigFiles () {
     echo "Checking if Solr is running"
     _STATUS=$(curl -H "Content-Type: application/json" --user $_SOLR_USER:$_SOLR_PASSWORD --write-out "%{http_code}\n" --silent --output /dev/null http://localhost:$_SOLR_PORT/solr/admin/cores?action=STATUS)
     if [ 200 != "$_STATUS" ]; then
-        if ! sudo service solr start >/dev/null 2>&1; then
+        if ! sudo /etc/init.d/solr start >/dev/null 2>&1; then
             echo "Solr is not running and can not be started"
             exit 1;
         fi
@@ -283,7 +291,7 @@ updateSolrConfigFiles () {
     fi
 
     echo "Shutting down Solr for updating the core"
-    sudo service solr stop >/dev/null 2>&1
+    sudo /etc/init.d/solr stop >/dev/null 2>&1
 
     if sudo [ !  -d "$_SOLR_HOME/data/$_SOLR_CORE/conf" ]; then
         echo "Wrong Solr home path was specified please check again"
@@ -294,13 +302,13 @@ updateSolrConfigFiles () {
     _SOLR_CORE_CONF_DIR=$_SOLR_HOME/data/$_SOLR_CORE/conf
 
     echo "Updating SolR Configuration files based on GitHub"
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/schema.xml -O $_SOLR_CORE_CONF_DIR/schema.xml >/dev/null 2>&1
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/solrconfig.xml -O $_SOLR_CORE_CONF_DIR/solrconfig.xml >/dev/null 2>&1
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/stopwords.txt -O $_SOLR_CORE_CONF_DIR/stopwords.txt >/dev/null 2>&1
-    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/reactome/search-indexer/$_GIT_BRANCH/solr-conf/prefixstopwords.txt -O $_SOLR_CORE_CONF_DIR/prefixstopwords.txt >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/schema.xml -O $_SOLR_CORE_CONF_DIR/schema.xml >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/solrconfig.xml -O $_SOLR_CORE_CONF_DIR/solrconfig.xml >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/stopwords.txt -O $_SOLR_CORE_CONF_DIR/stopwords.txt >/dev/null 2>&1
+    sudo wget -q --no-check-certificate https://raw.githubusercontent.com/plantreactome/search-indexer/$_GIT_BRANCH/solr-conf/prefixstopwords.txt -O $_SOLR_CORE_CONF_DIR/prefixstopwords.txt >/dev/null 2>&1
 
     echo "Starting Solr"
-    if ! sudo service solr start ; then
+    if ! sudo /etc/init.d/solr start ; then
         echo "Could not start Solr server"
         exit 1;
     fi
@@ -329,7 +337,7 @@ runIndexer () {
     echo "Checking if Solr is running..."
     _STATUS=$(curl -H "Content-Type: application/json" --user $_SOLR_USER:$_SOLR_PASSWORD --write-out "%{http_code}\n" --silent --output /dev/null http://localhost:$_SOLR_PORT/solr/admin/cores?action=STATUS)
     if [ 200 != "$_STATUS" ]; then
-        if ! sudo service solr start >/dev/null 2>&1; then
+        if ! sudo /etc/init.d/solr start >/dev/null 2>&1; then
             echo "Solr is not running and can not be started"
             exit 1;
         fi
@@ -350,7 +358,7 @@ runIndexer () {
 
             echo "Cloning project from repository..."
 
-            git clone https://github.com/reactome/search-indexer.git
+            git clone https://github.com/plantreactome/search-indexer.git
 
             git -C ./search-indexer/ fetch && git -C ./search-indexer/ checkout $_GIT_BRANCH
             _PATH="/search-indexer"

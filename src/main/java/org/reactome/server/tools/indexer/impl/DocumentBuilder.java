@@ -221,7 +221,10 @@ class DocumentBuilder {
 
         IndexerMapSet<String, String> mapSet = new IndexerMapSet<>();
         for (Publication publication : literatureReference) {
-            mapSet.add("title", publication.getTitle());
+            if (publication.getTitle() != null)
+                mapSet.add("title", publication.getTitle());
+            else
+                mapSet.add("title","");
             if (publication instanceof LiteratureReference) {
                 mapSet.add("pubMedIdentifier", ((LiteratureReference) publication).getPubMedIdentifier() + "");
             } else if (publication instanceof Book) {
@@ -267,10 +270,12 @@ class DocumentBuilder {
             }
         }
 
-        if (!summationText.contains("computationally inferred")) {
-            document.setSummation(summationText);
-        } else {
-            document.setInferredSummation(summationText);
+        if (summationText != null) {
+            if (!summationText.contains("computationally inferred")) {
+                document.setSummation(summationText);
+            } else {
+                document.setInferredSummation(summationText);
+            }
         }
     }
 
@@ -428,7 +433,7 @@ class DocumentBuilder {
 
             setReferenceCrossReference(document, referenceEntity.getCrossReference());
 
-            if (identifier != null) {
+            if (identifier != null && referenceEntity.getReferenceDatabase() != null) {
                 List<String> referenceIdentifiers = new LinkedList<>();
                 referenceIdentifiers.add(identifier);
                 referenceIdentifiers.add(referenceEntity.getReferenceDatabase().getDisplayName() + ":" + identifier);
@@ -466,12 +471,15 @@ class DocumentBuilder {
         // allCrossReferences are used in the Marshaller (ebeye.xml)
         List<CrossReference> allXRefs = new ArrayList<>();
         for (DatabaseIdentifier databaseIdentifier : referenceCrossReferences) {
-            crossReferencesInfo.add(databaseIdentifier.getIdentifier());
+            if (databaseIdentifier.getReferenceDatabase() != null && databaseIdentifier.getIdentifier() != null) {
 
-            CrossReference crossReference = new CrossReference();
-            crossReference.setId(databaseIdentifier.getIdentifier());
-            crossReference.setDbName(databaseIdentifier.getReferenceDatabase().getDisplayName());
-            allXRefs.add(crossReference);
+                crossReferencesInfo.add(databaseIdentifier.getIdentifier());
+
+                CrossReference crossReference = new CrossReference();
+                crossReference.setId(databaseIdentifier.getIdentifier());
+                crossReference.setDbName(databaseIdentifier.getReferenceDatabase().getDisplayName());
+                allXRefs.add(crossReference);
+            }
         }
 
         document.setReferenceCrossReferences(crossReferencesInfo);
