@@ -187,12 +187,6 @@ class Marshaller {
                     writeField("keyword", keyword, iii);
                 }
             }
-            if (document.getRegulatedEntity() != null) {
-                writeField("regulated_entity", document.getRegulatedEntity(), iii);
-            }
-            if (document.getRegulator() != null) {
-                writeField("regulator", document.getRegulator(), iii);
-            }
             if (document.getCompartmentName() != null && !document.getCompartmentName().isEmpty()) {
                 for (String compartment : document.getCompartmentName()) {
                     writeField("compartment_name", compartment, iii);
@@ -234,6 +228,9 @@ class Marshaller {
                 String noHTMLString = document.getInferredSummation().replaceAll("<.*?>", "");
                 writeField("inferred_summation", noHTMLString, iii);
             }
+            if (document.isCovidRelated()) {
+                writeField("covid19", "true", iii);
+            }
 
             writer.write(ii + "</additional_fields>" + NEW_LINE);
 
@@ -264,7 +261,8 @@ class Marshaller {
     }
 
     private void writeRef(String db, String id, String indent) throws IOException {
-        db = db.replaceAll("/", "_");
+        db = db.trim().replaceAll("\\s*\\(.+\\)\\s*", "");
+        db = db.replaceAll("(/|\\s)", "_");
         writer.write(indent + "<ref dbname=\"" + db + "\" dbkey=\"" + StringEscapeUtils.escapeXml(id) + "\" />" + NEW_LINE);
     }
 

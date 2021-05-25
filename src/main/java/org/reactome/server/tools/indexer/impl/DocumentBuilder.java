@@ -1,14 +1,18 @@
 package org.reactome.server.tools.indexer.impl;
 
 import org.apache.commons.lang3.StringUtils;
+import org.neo4j.ogm.exception.MappingException;
 import org.reactome.server.graph.domain.model.*;
+import org.reactome.server.graph.domain.result.DiagramOccurrences;
 import org.reactome.server.graph.exception.CustomQueryException;
 import org.reactome.server.graph.service.AdvancedDatabaseObjectService;
 import org.reactome.server.graph.service.DatabaseObjectService;
+import org.reactome.server.graph.service.DiagramService;
+import org.reactome.server.graph.service.PathwaysService;
 import org.reactome.server.tools.indexer.model.CrossReference;
 import org.reactome.server.tools.indexer.model.IndexDocument;
 import org.reactome.server.tools.indexer.model.SpeciesResult;
-import org.reactome.server.tools.indexer.util.IndexerMapSet;
+import org.reactome.server.tools.indexer.util.MapSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,6 +25,8 @@ import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -31,38 +37,58 @@ class DocumentBuilder {
     private static final Logger logger = LoggerFactory.getLogger("importLogger");
 
     private static final String CONTROLLED_VOCABULARY = "controlledVocabulary.csv";
+    private static final String SARS_DOID_MAPPING = "sars_doid_mapping.csv";
+    public static final Pattern DB_ID_PATTERN = Pattern.compile("(?<db>\\w+).*:(?<id>.+)");
+    public static final Pattern SPACE_PATTERN = Pattern.compile("\\s");
 
-    @Autowired
     private DatabaseObjectService databaseObjectService;
-
-    @Autowired
     private AdvancedDatabaseObjectService advancedDatabaseObjectService;
+    private DiagramService diagramService;
+    private PathwaysService pathwaysService;
 
-    private Map<Long, Set<String>> simpleEntitiesSpecies = null;
+    private final Map<Long, Set<String>> simpleEntitiesAndDrugSpecies = new HashMap<>();
+    private final Collection<String> covid19enties = new ArrayList<>();
 
-    private List<String> keywords;
+    private final List<String> keywords;
+    private final List<String> SARSDoid;
 
     public DocumentBuilder() {
         keywords = loadFile(CONTROLLED_VOCABULARY);
         if (keywords == null) {
             logger.error("No keywords available");
         }
+
+        SARSDoid = loadFile(SARS_DOID_MAPPING);
+        if (SARSDoid == null) {
+            logger.error("No SARS DOID mapping available");
+        }
     }
 
     @Transactional
     IndexDocument createSolrDocument(Long dbId) {
+        synchronized (simpleEntitiesAndDrugSpecies) {
+            if (simpleEntitiesAndDrugSpecies.isEmpty()) cacheSimpleEntityAndDrugSpecies();
+        }
 
-        if (simpleEntitiesSpecies == null) {
-            cacheSimpleEntitySpecies();
+        synchronized (covid19enties) {
+            if (covid19enties.isEmpty()) cacheCovid19Entities();
+
         }
 
         IndexDocument document = new IndexDocument();
-        /**
-         * Query the Graph and load only Primitives and no Relations attributes. Lazy-loading will load them on demand.
+        /*
+         * Query the Graph and load only Primitives and no Relations attributes.
+         * Lazy-loading will load them on demand.
          */
-        DatabaseObject databaseObject = databaseObjectService.findById(dbId);
+        DatabaseObject databaseObject;
+        try {
+            databaseObject = databaseObjectService.findById(dbId);
+        } catch (MappingException e) {
+            logger.error("There has been an error mapping the object with dbId: " + dbId, e);
+            return null;
+        }
 
-        /** Setting common attributes **/
+        // Setting common attributes
         document.setDbId(databaseObject.getDbId().toString());
         document.setStId(databaseObject.getStId());
         document.setOldStId(databaseObject.getOldStId());
@@ -85,10 +111,8 @@ class DocumentBuilder {
             // SPECIFIC FOR PHYSICAL ENTITIES
             setGoTerms(document, physicalEntity.getGoCellularComponent());
             setReferenceEntity(document, physicalEntity);
-
         } else if (databaseObject instanceof Event) {
             Event event = (Event) databaseObject;
-
             // GENERAL ATTRIBUTES
             setNameAndSynonyms(document, event, event.getName());
             setLiteratureReference(document, event.getLiteratureReference());
@@ -97,7 +121,6 @@ class DocumentBuilder {
             setCompartment(document, event.getCompartment());
             setCrossReference(document, event.getCrossReference());
             setSpecies(document, event);
-            setAuthorAndReviewed(document, event);
 
             // SPECIFIC FOR EVENT
             setGoTerms(document, event.getGoBiologicalProcess());
@@ -105,40 +128,32 @@ class DocumentBuilder {
                 ReactionLikeEvent reactionLikeEvent = (ReactionLikeEvent) event;
                 setCatalystActivities(document, reactionLikeEvent.getCatalystActivity());
             }
-
-        } else if (databaseObject instanceof Regulation) {
-            Regulation regulation = (Regulation) databaseObject;
-
-            // GENERAL ATTRIBUTES
-            setNameAndSynonyms(document, regulation, regulation.getName());
-            setLiteratureReference(document, regulation.getLiteratureReference());
-            setSummation(document, regulation.getSummation());
-            setSpecies(document, regulation);
-
-            // SPECIFIC FOR REGULATIONS
-            setRegulatedEntity(document, regulation.getRegulatedEntity());
-            setRegulator(document, regulation.getRegulator());
-
         }
 
         setFireworksSpecies(document, databaseObject);
-
+        setDiagramOccurrences(document, databaseObject);
+        setLowerLevelPathways(document, databaseObject);
         // Keyword uses the document.getName. Name is set in the document by calling setNameAndSynonyms
         setKeywords(document);
+
+        // A second file is generated for covid19portal containing Reactome data related to COVID
+        document.setCovidRelated(covid19enties.contains(document.getStId()));
 
         return document;
     }
 
-    private void cacheSimpleEntitySpecies() {
-        logger.info("Caching SimpleEntity Species");
-        String query = "MATCH (n:SimpleEntity)<-[:regulatedBy|regulator|physicalEntity|entityFunctionalStatus|catalystActivity|hasMember|hasCandidate|hasComponent|repeatedUnit|input|output*]-(:ReactionLikeEvent)-[:species]->(s:Species) " +
-                       "WITH n, COLLECT(DISTINCT s.displayName) AS species " +
-                       "RETURN n.dbId AS dbId, species";
+    private void cacheSimpleEntityAndDrugSpecies() {
+        logger.info("Caching SimpleEntity and Drug Species");
+        String query = "" +
+                "MATCH (n)<-[:regulatedBy|regulator|physicalEntity|entityFunctionalStatus|catalystActivity|hasMember|hasCandidate|hasComponent|repeatedUnit|input|output*]-(:ReactionLikeEvent)-[:species]->(s:Species) " +
+                "WHERE (n:SimpleEntity) OR (n:Drug) " +
+                "WITH n, COLLECT(DISTINCT s.displayName) AS species " +
+                "RETURN n.dbId AS dbId, species";
         try {
-            Collection<SpeciesResult> speciesResultList = advancedDatabaseObjectService.customQueryForObjects(SpeciesResult.class, query, null);
-            simpleEntitiesSpecies = new HashMap<>(speciesResultList.size());
+            Collection<SpeciesResult> speciesResultList = advancedDatabaseObjectService.getCustomQueryResults(SpeciesResult.class, query, null);
+            //simpleEntitiesAndDrugSpecies = new HashMap<>(speciesResultList.size());
             for (SpeciesResult speciesResult : speciesResultList) {
-                simpleEntitiesSpecies.put(speciesResult.getDbId(), new HashSet<>(speciesResult.getSpecies()));
+                simpleEntitiesAndDrugSpecies.put(speciesResult.getDbId(), new HashSet<>(speciesResult.getSpecies()));
             }
         } catch (CustomQueryException e) {
             logger.error("Could not cache fireworks species");
@@ -147,11 +162,37 @@ class DocumentBuilder {
         logger.info("Caching SimpleEntity Species is done");
     }
 
+    private void cacheCovid19Entities() {
+        logger.info("Caching COVID19 Entities");
+        String query = "" +
+                "MATCH (n:DatabaseObject)-[:disease]-(d:Disease) " +
+                "WHERE d.identifier = {viral} " + // viral
+                "MATCH (n)-[:relatedSpecies|species]-(s:Species) " +
+                "WHERE s.displayName = \"Human SARS coronavirus\" " +
+                "MATCH (o:DatabaseObject)-[:disease]-(do:Disease) " +
+                "WHERE do.identifier IN  {sarsDisease} " +
+                "MATCH (o)-[:relatedSpecies|species]-(:Species) " +
+                "WITH n + collect(o) as final " +
+                "UNWIND final as f " +
+                "RETURN distinct f.stId as ST_ID";
+        try {
+            Map<String, Object> params = new HashMap<>(SARSDoid.size());
+            params.put("viral", SARSDoid.get(0));
+            params.put("sarsDisease", SARSDoid.stream().skip(1).collect(Collectors.toList()));
+            covid19enties.addAll(advancedDatabaseObjectService.getCustomQueryResults(String.class, query, params));
+        } catch (CustomQueryException e) {
+            logger.error("Could not cache covid19 entities");
+        }
+
+        logger.info("Caching COVID19 Entities is done");
+    }
+
     private void setFireworksSpecies(IndexDocument document, DatabaseObject databaseObject) {
         Set<String> fireworksSpecies = new HashSet<>();
-        if ((databaseObject instanceof SimpleEntity)) {
-            fireworksSpecies = simpleEntitiesSpecies.get(databaseObject.getDbId());
+        if ((databaseObject instanceof SimpleEntity || databaseObject instanceof Drug)) {
+            fireworksSpecies = simpleEntitiesAndDrugSpecies.get(databaseObject.getDbId());
         } else {
+            //noinspection Duplicates
             try {
                 Method getSpecies = databaseObject.getClass().getMethod("getSpecies");
                 Object species = getSpecies.invoke(databaseObject);
@@ -172,12 +213,17 @@ class DocumentBuilder {
             }
         }
 
-        document.setFireworksSpecies(fireworksSpecies.isEmpty() ? null : fireworksSpecies);
+        // Regulation and Other Entities may not have (fireworks)species and solr won't be able to find them
+        // in the Fireworks (filter query fireworksSpecies)
+        if (fireworksSpecies.isEmpty()) {
+            fireworksSpecies.add("Entries without species");
+        }
+
+        document.setFireworksSpecies(fireworksSpecies);
     }
 
     private void setNameAndSynonyms(IndexDocument document, DatabaseObject databaseObject, List<String> name) {
         if (name == null || name.isEmpty()) {
-            // some regulations do not have name
             document.setName(databaseObject.getDisplayName());
             return;
         }
@@ -219,7 +265,7 @@ class DocumentBuilder {
     private void setLiteratureReference(IndexDocument document, List<Publication> literatureReference) {
         if (literatureReference == null) return;
 
-        IndexerMapSet<String, String> mapSet = new IndexerMapSet<>();
+        MapSet<String, String> mapSet = new MapSet<>();
         for (Publication publication : literatureReference) {
             if (publication.getTitle() != null)
                 mapSet.add("title", publication.getTitle());
@@ -254,19 +300,14 @@ class DocumentBuilder {
     private void setSummation(IndexDocument document, List<Summation> summations) {
         if (summations == null) return;
 
-        // Creating a report - We should have only one summation
-//        if (summations.size() >= 2) {
-            //logger.info("[SUMMATION] - " + document.getDbId());
-//        }
-
-        String summationText = "";
+        StringBuilder summationText = new StringBuilder();
         boolean first = true;
         for (Summation summation : summations) {
             if (first) {
-                summationText = summation.getText();
+                summationText = new StringBuilder(summation.getText());
                 first = false;
             } else {
-                summationText = summationText + "<br>" + summation.getText();
+                summationText.append("<br>").append(summation.getText());
             }
         }
 
@@ -346,7 +387,6 @@ class DocumentBuilder {
 
     private void setSpecies(IndexDocument document, DatabaseObject databaseObject) {
         Collection<? extends Taxon> speciesCollection = null;
-        List<String> relatedSpecies;
         if (databaseObject instanceof GenomeEncodedEntity) {
             GenomeEncodedEntity genomeEncodedEntity = (GenomeEncodedEntity) databaseObject;
             if (genomeEncodedEntity.getSpecies() != null) {
@@ -355,9 +395,15 @@ class DocumentBuilder {
         } else if (databaseObject instanceof EntitySet) {
             EntitySet entitySet = (EntitySet) databaseObject;
             speciesCollection = entitySet.getSpecies();
+            if (entitySet.getRelatedSpecies() != null && !entitySet.getRelatedSpecies().isEmpty()) {
+                document.setRelatedSpecies(entitySet.getRelatedSpecies().stream().map(Species::getDisplayName).collect(Collectors.toList()));
+            }
         } else if (databaseObject instanceof Complex) {
             Complex complex = (Complex) databaseObject;
             speciesCollection = complex.getSpecies();
+            if (complex.getRelatedSpecies() != null && !complex.getRelatedSpecies().isEmpty()) {
+                document.setRelatedSpecies(complex.getRelatedSpecies().stream().map(Species::getDisplayName).collect(Collectors.toList()));
+            }
         } else if (databaseObject instanceof SimpleEntity) {
             SimpleEntity simpleEntity = (SimpleEntity) databaseObject;
             if (simpleEntity.getSpecies() != null) {
@@ -369,10 +415,8 @@ class DocumentBuilder {
         } else if (databaseObject instanceof Event) {
             Event event = (Event) databaseObject;
             speciesCollection = event.getSpecies();
-
-            if (event.getRelatedSpecies() != null) {
-                relatedSpecies = event.getRelatedSpecies().stream().map(Species::getDisplayName).collect(Collectors.toList());
-                document.setRelatedSpecies(relatedSpecies);
+            if (event.getRelatedSpecies() != null && !event.getRelatedSpecies().isEmpty()) {
+                document.setRelatedSpecies(event.getRelatedSpecies().stream().map(Species::getDisplayName).collect(Collectors.toList()));
             }
         }
 
@@ -391,21 +435,18 @@ class DocumentBuilder {
         if (databaseObject == null) return;
 
         ReferenceEntity referenceEntity = null;
-        String identifier;
 
         if (databaseObject instanceof EntityWithAccessionedSequence) {
             EntityWithAccessionedSequence ewas = (EntityWithAccessionedSequence) databaseObject;
             referenceEntity = ewas.getReferenceEntity();
-        } else if (databaseObject instanceof OpenSet) {
-            OpenSet openSet = (OpenSet) databaseObject;
-            referenceEntity = openSet.getReferenceEntity();
+            setModifiedResidue(document, ewas.getHasModifiedResidue());
         } else if (databaseObject instanceof SimpleEntity) {
             SimpleEntity simpleEntity = (SimpleEntity) databaseObject;
             referenceEntity = simpleEntity.getReferenceEntity();
         }
 
         if (referenceEntity != null) {
-            identifier = referenceEntity.getIdentifier();
+            String identifier = referenceEntity.getIdentifier();
 
             if (referenceEntity instanceof ReferenceSequence) {
                 ReferenceSequence referenceSequence = (ReferenceSequence) referenceEntity;
@@ -419,6 +460,15 @@ class DocumentBuilder {
                         identifier = referenceIsoform.getVariantIdentifier();
                     }
                 }
+                if (referenceSequence instanceof ReferenceGeneProduct) {
+                    ReferenceGeneProduct referenceGeneProduct = (ReferenceGeneProduct) referenceSequence;
+                    document.setReferenceDNAIdentifiers(getReferenceIdentifiers(referenceGeneProduct.getReferenceGene()));
+                    document.setReferenceRNAIdentifiers(getReferenceIdentifiers(referenceGeneProduct.getReferenceTranscript()));
+                }
+                if (referenceSequence instanceof ReferenceRNASequence) {
+                    ReferenceRNASequence referenceRNASequence = (ReferenceRNASequence) referenceSequence;
+                    document.setReferenceDNAIdentifiers(getReferenceIdentifiers(referenceRNASequence.getReferenceGene()));
+                }
             }
 
             // Setting TYPE and EXACT TYPE for the given PhysicalEntity
@@ -431,12 +481,13 @@ class DocumentBuilder {
 
             document.setReferenceOtherIdentifier(referenceEntity.getOtherIdentifier());
 
+            setReferenceOtherIdentifiers(document, referenceEntity.getOtherIdentifier());
             setReferenceCrossReference(document, referenceEntity.getCrossReference());
 
             if (identifier != null && referenceEntity.getReferenceDatabase() != null) {
                 List<String> referenceIdentifiers = new LinkedList<>();
                 referenceIdentifiers.add(identifier);
-                referenceIdentifiers.add(referenceEntity.getReferenceDatabase().getDisplayName() + ":" + identifier);
+                referenceIdentifiers.add(referenceEntity.getDatabaseName() + ':' + referenceEntity.getIdentifier());
                 document.setReferenceIdentifiers(referenceIdentifiers);
                 document.setDatabaseName(referenceEntity.getReferenceDatabase().getDisplayName());
 
@@ -446,6 +497,32 @@ class DocumentBuilder {
                 }
             }
         }
+    }
+
+    private void setModifiedResidue(IndexDocument document, List<AbstractModifiedResidue> abstractModifiedResidues) {
+        Set<String> fragments = new HashSet<>();
+        for (AbstractModifiedResidue amr : abstractModifiedResidues) {
+            final ReferenceSequence referenceSequence = amr.getReferenceSequence();
+            if (referenceSequence != null) {
+                if (referenceSequence.getIdentifier() != null) fragments.add(referenceSequence.getIdentifier());
+                if (referenceSequence.getGeneName() != null && !referenceSequence.getGeneName().isEmpty())
+                    fragments.addAll(referenceSequence.getGeneName());
+                if (referenceSequence.getOtherIdentifier() != null && !referenceSequence.getOtherIdentifier().isEmpty())
+                    fragments.addAll(referenceSequence.getOtherIdentifier());
+                if (referenceSequence instanceof ReferenceGeneProduct) {
+                    ReferenceGeneProduct rgp = (ReferenceGeneProduct) referenceSequence;
+                    for (ReferenceDNASequence referenceDNASequence : rgp.getReferenceGene()) {
+                        if (referenceDNASequence.getIdentifier() != null)
+                            fragments.add(referenceDNASequence.getIdentifier());
+                        if (referenceDNASequence.getGeneName() != null && !referenceDNASequence.getGeneName().isEmpty())
+                            fragments.addAll(referenceDNASequence.getGeneName());
+                        if (referenceDNASequence.getOtherIdentifier() != null && !referenceDNASequence.getOtherIdentifier().isEmpty())
+                            fragments.addAll(referenceDNASequence.getOtherIdentifier());
+                    }
+                }
+            }
+        }
+        if (!fragments.isEmpty()) document.setFragmentModification(fragments);
     }
 
     private String getReferenceTypes(ReferenceEntity referenceEntity) {
@@ -460,6 +537,29 @@ class DocumentBuilder {
         } else {
             return referenceEntity.getSchemaClass();
         }
+    }
+
+    private List<String> getReferenceIdentifiers(List<? extends ReferenceEntity> referenceEntities) {
+        Set<String> identifiers = new TreeSet<>();
+        if (referenceEntities == null) return new LinkedList<>();
+        for (ReferenceEntity referenceEntity : referenceEntities) {
+            identifiers.add(SPACE_PATTERN.split(referenceEntity.getDatabaseName())[0] + ':' + referenceEntity.getIdentifier());
+            identifiers.add(referenceEntity.getDatabaseName().replace(" ", "-") + ':' + referenceEntity.getIdentifier());
+            identifiers.add(referenceEntity.getIdentifier());
+        }
+        return new LinkedList<>(identifiers);
+    }
+
+    private void setReferenceOtherIdentifiers(IndexDocument document, List<String> otherIdentifiers) {
+        if (otherIdentifiers == null) return;
+        Set<String> fullOtherIdentifiers = new TreeSet<>(otherIdentifiers);
+        // If other identifier of shape "<db>:<id>", index as well <id>
+        for (String otherIdentifier : otherIdentifiers) {
+            Matcher matcher = DB_ID_PATTERN.matcher(otherIdentifier);
+            if (matcher.find()) fullOtherIdentifiers.add(matcher.group("id"));
+        }
+
+        document.setReferenceOtherIdentifier(new LinkedList<>(fullOtherIdentifiers));
     }
 
     private void setReferenceCrossReference(IndexDocument document, List<DatabaseIdentifier> referenceCrossReferences) {
@@ -512,87 +612,43 @@ class DocumentBuilder {
         } else if (databaseObject instanceof ReactionLikeEvent) {
             // Also covering BlackBoxEvent, (De)Polymerisation, (Failed)Reaction
             return "Reaction";
-        } else if (databaseObject instanceof Regulation) {
-            // Also covering PositiveRegulation, NegativeRegulation, Requirement
-            return "Regulation";
         } else {
             return databaseObject.getSchemaClass();
         }
     }
 
-    private void setRegulatedEntity(IndexDocument document, DatabaseObject regulatedEntity) {
-        if (regulatedEntity == null) return;
+    private void setDiagramOccurrences(IndexDocument document, DatabaseObject databaseObject) {
+        Collection<DiagramOccurrences> dgoc = diagramService.getDiagramOccurrences(databaseObject.getStId());
+        if (dgoc == null || dgoc.isEmpty()) return;
 
-        // TODO: Set name as the displayName, then we avoid querying for a physical entity and get the regulated entity.
-        List<String> names = new ArrayList<>();
-        if (regulatedEntity instanceof CatalystActivity) {
-            CatalystActivity ca = (CatalystActivity) regulatedEntity;
-
-            // TODO: getPhysicalEntity is wrong. We should invoke List - getCatalizedEvents(). DISCUSS.
-            names = ca.getPhysicalEntity().getName();
-        } else if (regulatedEntity instanceof Event) {
-            Event ev = (Event) regulatedEntity;
-            names = ev.getName();
-        } else {
-            names.add(regulatedEntity.getDisplayName());
+        List<String> diagrams = new ArrayList<>();
+        List<String> occurrences = new ArrayList<>();
+        //noinspection Duplicates
+        for (DiagramOccurrences diagramOccurrence : dgoc) {
+            diagrams.add(diagramOccurrence.getDiagram().getStId());
+            String occurr = diagramOccurrence.getDiagram().getStId() + ":" + diagramOccurrence.isInDiagram();
+            if (diagramOccurrence.getOccurrences() != null && !diagramOccurrence.getOccurrences().isEmpty()) {
+                occurr = occurr + ":" + StringUtils.join(diagramOccurrence.getOccurrences().stream().map(DatabaseObject::getStId).collect(Collectors.toList()), ",");
+            } else {
+                occurr = occurr + ":#"; // no occurrences, using one char so less bytes in the solr index
+            }
+            if (diagramOccurrence.getInteractsWith() != null && !diagramOccurrence.getInteractsWith().isEmpty()) {
+                occurr = occurr + ":" + StringUtils.join(diagramOccurrence.getInteractsWith().stream().map(DatabaseObject::getStId).collect(Collectors.toList()), ",");
+            } else {
+                occurr = occurr + ":#"; // empty interactsWith, using one char so less bytes in the solr index
+            }
+            occurrences.add(occurr);
         }
-
-        if (names != null && !names.isEmpty()) document.setRegulatedEntity(names.get(0));
-
-        if (StringUtils.isNotEmpty(regulatedEntity.getStId())) {
-            document.setRegulatedEntityId(regulatedEntity.getStId());
-        } else {
-            document.setRegulatedEntityId(regulatedEntity.getDbId().toString());
-        }
+        document.setDiagrams(diagrams);
+        document.setOccurrences(occurrences);
     }
 
-    private void setAuthorAndReviewed(IndexDocument document, Event event) {
-        if (event.getAuthored() == null && event.getReviewed() == null) return;
+    private void setLowerLevelPathways(IndexDocument document, DatabaseObject databaseObject) {
+        Collection<Pathway> pathways = pathwaysService.getLowerLevelPathwaysIncludingEncapsulation(databaseObject.getStId());
+        if (pathways == null || pathways.isEmpty()) return;
 
-        // Using a set to avoid duplication
-        Set<String> authorAndReviewerNames = new HashSet<>();
-        Set<String> authorAndReviewerOrcid = new HashSet<>();
-
-        if (event.getAuthored() != null) {
-            authorAndReviewerNames.addAll(event.getAuthored().stream().filter(f -> f.getAuthor() != null).flatMap(e -> e.getAuthor().stream().map(p -> (StringUtils.isEmpty(p.getFirstname()) ? p.getInitial() : p.getFirstname()) + " " + p.getSurname())).collect(Collectors.toList()));
-            authorAndReviewerOrcid.addAll(event.getAuthored().stream().filter(f -> f.getAuthor() != null).flatMap(e -> e.getAuthor().stream().filter(p -> p.getOrcidId() != null).map(Person::getOrcidId)).collect(Collectors.toList()));
-        }
-
-        if (event.getReviewed() != null) {
-            authorAndReviewerNames.addAll(event.getReviewed().stream().filter(f -> f.getAuthor() != null).flatMap(e -> e.getAuthor().stream().map(p -> (StringUtils.isEmpty(p.getFirstname()) ? p.getInitial() : p.getFirstname()) + " " + p.getSurname())).collect(Collectors.toList()));
-            authorAndReviewerOrcid.addAll(event.getReviewed().stream().filter(f -> f.getAuthor() != null).flatMap(e -> e.getAuthor().stream().filter(p -> p.getOrcidId() != null).map(Person::getOrcidId)).collect(Collectors.toList()));
-        }
-
-        document.setAuthor(authorAndReviewerNames.isEmpty() ? null : authorAndReviewerNames);
-        document.setAuthorOrcid(authorAndReviewerOrcid.isEmpty() ? null : authorAndReviewerOrcid);
+        document.setLlps(pathways.stream().map(DatabaseObject::getStId).collect(Collectors.toList()));
     }
-
-    private void setRegulator(IndexDocument document, DatabaseObject regulator) {
-        if (regulator == null) return;
-
-        List<String> names = new ArrayList<>();
-        if (regulator instanceof CatalystActivity) {
-            CatalystActivity ca = (CatalystActivity) regulator;
-            names = ca.getPhysicalEntity().getName();
-        } else if (regulator instanceof Event) {
-            Event ev = (Event) regulator;
-            names = ev.getName();
-        } else if (regulator instanceof PhysicalEntity) {
-            PhysicalEntity pe = (PhysicalEntity) regulator;
-            names = pe.getName();
-        } else {
-            names.add(regulator.getDisplayName());
-        }
-
-        if (names != null && !names.isEmpty()) document.setRegulator(names.get(0));
-
-        if (StringUtils.isNotEmpty(regulator.getStId())) {
-            document.setRegulatorId(regulator.getStId());
-        } else {
-            document.setRegulatorId(regulator.getDbId().toString());
-        }
-    }
-
 
     /**
      * Keyword rely on document.getName. Make sure you are invoking document.setName before setting the keywords
@@ -609,7 +665,6 @@ class DocumentBuilder {
     /**
      * Load a file that is present in classpath
      *
-     * @param fileName the file name
      * @return the content file in a List of String
      */
     private List<String> loadFile(String fileName) {
@@ -627,5 +682,25 @@ class DocumentBuilder {
             logger.error("An error occurred when loading the controlled vocabulary file", e);
         }
         return null;
+    }
+
+    @Autowired
+    public void setDatabaseObjectService(DatabaseObjectService databaseObjectService) {
+        this.databaseObjectService = databaseObjectService;
+    }
+
+    @Autowired
+    public void setAdvancedDatabaseObjectService(AdvancedDatabaseObjectService advancedDatabaseObjectService) {
+        this.advancedDatabaseObjectService = advancedDatabaseObjectService;
+    }
+
+    @Autowired
+    public void setDiagramService(DiagramService diagramService) {
+        this.diagramService = diagramService;
+    }
+
+    @Autowired
+    public void setPathwaysService(PathwaysService pathwaysService) {
+        this.pathwaysService = pathwaysService;
     }
 }
