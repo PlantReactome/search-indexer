@@ -311,11 +311,11 @@ class DocumentBuilder {
             }
         }
 
-        if (summationText != null) {
-            if (!summationText.contains("computationally inferred")) {
-                document.setSummation(summationText);
+        if (summationText != null ) {
+            if (!summationText.toString().contains("computationally inferred")) {
+                document.setSummation(summationText.toString());
             } else {
-                document.setInferredSummation(summationText);
+                document.setInferredSummation(summationText.toString());
             }
         }
     }
